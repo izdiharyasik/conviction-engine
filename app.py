@@ -34,58 +34,92 @@ class ConvictionEngine:
         self.tickers = tickers
 
     def get_data(self, ticker):
-        df = yf.download(ticker, period="60d", interval="1d", progress=False)
+        # Force auto_adjust to True to simplify the columns
+        df = yf.download(ticker, period="100d", interval="1d", progress=False, auto_adjust=True)
         return df
 
     def detect_fvg(self, df):
-        if len(df) < 5: return None
+        # Check if we have enough data and that the dataframe isn't empty
+        if df is None or len(df) < 20: 
+            return None
         
-        # Latest 3 candles (excluding current forming candle)
-        c1 = df.iloc[-4] # Older
-        c2 = df.iloc[-3] # Displacement
-        c3 = df.iloc[-2] # Confirmation
-        
-        # Bullish FVG (Gap between Candle 1 High and Candle 3 Low)
-        is_bullish = c1['High'] < c3['Low']
-        # Displacement check (Body of C2 must be > 1.5x ATR)
-        body_size = abs(c2['Close'] - c2['Open'])
-        atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-3]
-        
-        if is_bullish and body_size > (atr * 1.2):
-            return {
-                "type": "BULLISH",
-                "gap_top": c3['Low'],
-                "gap_bottom": c1['High'],
-                "entry": c3['Low'],
-                "sl": c1['Low'],
-                "tp": c3['Low'] + ((c3['Low'] - c1['Low']) * 2), # 1:2 RR
-                "volume_spike": c2['Volume'] > df['Volume'].rolling(20).mean().iloc[-3]
-            }
+        try:
+            # Latest 3 candles (excluding current forming candle)
+            # Using .iloc[].item() or float() ensures we get a single number, not a Series
+            c1 = df.iloc[-4] 
+            c2 = df.iloc[-3] 
+            c3 = df.iloc[-2] 
+            
+            c1_high = float(c1['High'])
+            c1_low = float(c1['Low'])
+            c2_open = float(c2['Open'])
+            c2_close = float(c2['Close'])
+            c3_low = float(c3['Low'])
+            c3_high = float(c3['High'])
+
+            # Logic: Bullish FVG (Gap between Candle 1 High and Candle 3 Low)
+            is_bullish = bool(c1_high < c3_low)
+            
+            # Displacement check (Body of C2 must be large)
+            body_size = abs(c2_close - c2_open)
+            
+            # Calculate ATR safely
+            df_diff = df['High'] - df['Low']
+            atr_series = df_diff.rolling(14).mean()
+            atr = float(atr_series.iloc[-3])
+            
+            # Use volume safely
+            v_ma = df['Volume'].rolling(20).mean().iloc[-3]
+            c2_volume = float(c2['Volume'])
+            volume_spike = bool(c2_volume > v_ma)
+
+            if is_bullish and body_size > (atr * 1.2):
+                return {
+                    "type": "BULLISH",
+                    "gap_top": c3_low,
+                    "gap_bottom": c1_high,
+                    "entry": c3_low,
+                    "sl": c1_low,
+                    "tp": c3_low + ((c3_low - c1_low) * 2), 
+                    "volume_spike": volume_spike
+                }
+        except Exception as e:
+            # If a specific ticker has bad data, skip it and continue
+            return None
+            
         return None
 
     def score_setup(self, ticker, setup, df):
         score = 0
         if not setup: return 0
         
-        # 1. FVG Quality (Size of gap)
-        gap_pct = (setup['gap_top'] - setup['gap_bottom']) / setup['gap_bottom']
-        score += min(5, gap_pct * 500)
-        
-        # 2. Volume Spike
-        if setup['volume_spike']: score += 5
-        
-        # 3. Trend Alignment (Above SMA 20)
-        sma20 = df['Close'].rolling(20).mean().iloc[-1]
-        if df['Close'].iloc[-1] > sma20: score += 5
-        
-        # 4. RR Quality
-        rr = (setup['tp'] - setup['entry']) / (setup['entry'] - setup['sl'])
-        if rr >= 2: score += 5
-        
-        # 5. Liquidity (Basic Check)
-        avg_val = (df['Close'] * df['Volume']).rolling(20).mean().iloc[-1]
-        if avg_val > 50_000_000_000: # 50 Bio IDR
-            score += 5
+        try:
+            last_close = float(df['Close'].iloc[-1])
+            
+            # 1. FVG Quality (Size of gap)
+            gap_pct = (setup['gap_top'] - setup['gap_bottom']) / setup['gap_bottom']
+            score += min(5, gap_pct * 500)
+            
+            # 2. Volume Spike
+            if setup['volume_spike']: score += 5
+            
+            # 3. Trend Alignment (Above SMA 20)
+            sma20 = df['Close'].rolling(20).mean().iloc[-1]
+            if last_close > sma20: score += 5
+            
+            # 4. RR Quality
+            risk = setup['entry'] - setup['sl']
+            reward = setup['tp'] - setup['entry']
+            if risk > 0:
+                rr = reward / risk
+                if rr >= 2: score += 5
+            
+            # 5. Liquidity (Average Daily Value > 50 Billion IDR)
+            avg_val = (df['Close'] * df['Volume']).rolling(20).mean().iloc[-1]
+            if avg_val > 50_000_000_000:
+                score += 5
+        except:
+            return 0
             
         return round(score, 2)
 
@@ -93,6 +127,8 @@ class ConvictionEngine:
         candidates = []
         for ticker in self.tickers:
             df = self.get_data(ticker)
+            if df.empty: continue
+            
             setup = self.detect_fvg(df)
             if setup:
                 score = self.score_setup(ticker, setup, df)
