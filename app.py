@@ -286,8 +286,8 @@ def main():
                     supabase.table("trades").insert(trade_data).execute()
                     st.success(f"Logged {ticker} to tracking database!")
 
-     if st.button("🔍 Run Full Market Scan"):
-        with st.spinner("Scanning IDX Universe..."):
+                   if st.button("🔍 Run Full Market Scan"):
+            with st.spinner("Scanning IDX Universe..."):
             engine = ConvictionEngine(IDX_TICKERS)
             best_pick, watchlist_items = engine.scan_all()
             
@@ -315,7 +315,9 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
             else:
-                st.write("No setups currently forming.")
+                st.write("No setups currently forming.")     
+
+     
 
     # 3. HISTORY & PERFORMANCE
     st.divider()
