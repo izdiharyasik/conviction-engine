@@ -4,160 +4,173 @@ import yfinance as yf
 from supabase import create_client, Client
 import plotly.graph_objects as go
 from datetime import datetime
-import numpy as np
 
-# --- 1. PREMIUM STYLING ---
-st.set_page_config(page_title="Conviction Engine Pro", layout="wide")
+# --- 1. SETTINGS & STYLING (Readability Fix) ---
+st.set_page_config(page_title="Conviction Engine", layout="wide")
 
 st.markdown("""
     <style>
-    /* Main Background and Card Styling */
-    .stApp { background-color: #0e1117; }
-    div[data-testid="stMetricValue"] { font-size: 1.8rem !important; color: #00ff88; }
-    .trade-card {
+    .main { background-color: #0d1117; }
+    /* Metric Readability */
+    [data-testid="stMetricValue"] { color: #00ff88 !important; font-weight: bold; }
+    [data-testid="stMetricLabel"] { color: #e1e4e8 !important; }
+    
+    /* Card Contrast Fix */
+    .setup-card {
         background-color: #161b22;
         border: 1px solid #30363d;
-        border-radius: 10px;
+        border-radius: 8px;
         padding: 20px;
-        margin-bottom: 20px;
-    }
-    .watchlist-card {
-        background-color: #0d1117;
-        border-left: 5px solid #58a6ff;
-        padding: 15px;
-        border-radius: 5px;
+        color: #f0f6fc;
         margin-bottom: 10px;
     }
+    .watchlist-box {
+        background-color: #0d1117;
+        border: 1px solid #3d444d;
+        padding: 15px;
+        border-radius: 5px;
+        color: #c9d1d9;
+    }
+    h1, h2, h3, p { color: #f0f6fc !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. DATABASE & DATA HANDLERS ---
-try:
-    supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-except:
-    st.error("Check Supabase Secrets")
-
+# --- 2. CORE ENGINE LOGIC ---
 class ConvictionEngine:
-    # ... [Keep your existing get_data, is_gorengan, and detect_fvg logic here] ...
-    # (Just ensure they are inside the class)
-    
-    def get_data(self, ticker):
+    def __init__(self):
+        self.universe = ["BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK", "ADRO.JK", "GOTO.JK", "MDKA.JK"]
+        
+    @st.cache_data(ttl=3600) # Cache data for 1 hour to save speed
+    def get_data(_self, ticker):
         try:
-            df = yf.download(ticker, period="100d", interval="1d", progress=False)
+            df = yf.download(ticker, period="60d", interval="1d", progress=False)
             if df.empty: return None
             df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
             return df
         except: return None
 
-    def detect_fvg(self, df):
-        if df is None or len(df) < 20: return None
-        for i in range(2, 10):
+    def detect_fvg(_self, df):
+        if df is None or len(df) < 15: return None
+        # Check last 5 candles
+        for i in range(2, 7):
             c1, c2, c3 = df.iloc[-i-2], df.iloc[-i-1], df.iloc[-i]
             if float(c1['High']) < float(c3['Low']): # Bullish FVG
                 return {
-                    "type": "SIGNAL" if float(df['Close'].iloc[-1]) < float(c3['Low'])*1.01 else "WATCHLIST",
-                    "entry": float(c3['Low']), "sl": float(c1['Low']),
-                    "tp": float(c3['Low']) + (float(c3['Low'])-float(c1['Low']))*2,
+                    "entry": round(float(c3['Low']), 0),
+                    "sl": round(float(c1['Low']), 0),
+                    "tp": round(float(c3['Low']) + (float(c3['Low'])-float(c1['Low']))*2, 0),
                     "gap": (float(c1['High']), float(c3['Low'])),
-                    "df_slice": df.iloc[-i-10 : -i+5] # For charting
+                    "current": float(df['Close'].iloc[-1]),
+                    "df_slice": df.iloc[-i-10 : ]
                 }
         return None
 
-# --- 3. UI COMPONENTS ---
+# --- 3. DATABASE CONNECTION ---
+@st.cache_resource
+def init_db():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
-def render_candlestick(ticker, setup):
-    df = setup['df_slice']
-    fig = go.Figure(data=[go.Candlestick(
-        x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        increasing_line_color='#00ff88', decreasing_line_color='#ff4b4b'
-    )])
-    
-    # Highlight FVG Zone
-    fig.add_shape(
-        type="rect", x0=df.index[0], x1=df.index[-1],
-        y0=setup['gap'][0], y1=setup['gap'][1],
-        fillcolor="yellow", opacity=0.2, layer="below", line_width=0,
-    )
-    
-    fig.update_layout(
-        title=f"{ticker} FVG Evidence",
-        template="plotly_dark",
-        xaxis_rangeslider_visible=False,
-        height=400,
-        margin=dict(l=10, r=10, t=40, b=10)
-    )
-    st.plotly_chart(fig, use_container_width=True)
+supabase = init_db()
 
 # --- 4. MAIN APP ---
-
 def main():
-    # Sidebar: Risk Settings
-    st.sidebar.image("https://cdn-icons-png.flaticon.com/512/2533/2533514.png", width=100)
-    st.sidebar.title("Conviction Engine")
-    cap = st.sidebar.number_input("Portfolio Capital (IDR)", 100_000_000)
-    risk_pct = st.sidebar.slider("Risk Per Trade %", 0.5, 3.0, 1.0)
+    st.title("🎯 Conviction Engine")
     
-    engine = ConvictionEngine()
-    
-    # Top Metrics Bar
+    # Sidebar Setup
+    with st.sidebar:
+        st.header("Portfolio Config")
+        capital = st.number_input("Total Capital (IDR)", value=100000000, step=1000000)
+        risk_pct = st.slider("Risk per Trade (%)", 0.5, 3.0, 1.0)
+        st.divider()
+        st.write("Targeting LQ45 Institutional Flow")
+
+    # Metrics Row
     m1, m2, m3 = st.columns(3)
-    m1.metric("Market Status", "IDX OPEN" if datetime.now().hour < 16 else "IDX CLOSED", "Active")
-    m2.metric("Universe", "80 Tickers", "Liquid")
-    m3.metric("Strategy", "FVG Institutional", "Bullish")
+    m1.metric("Market", "IDX", "Active")
+    m2.metric("Strategy", "FVG Retest", "Bullish")
+    m3.metric("Universe", "LQ45 Core", "Liquid")
 
-    if st.button("🚀 SCAN MARKET FOR CONVICTION"):
-        with st.spinner("Hunting for Smart Money entries..."):
-            # logic to scan...
-            # (Sample results for UI demonstration)
-            df_sample = engine.get_data("BMRI.JK")
-            setup = engine.detect_fvg(df_sample)
+    engine = ConvictionEngine()
+
+    if st.button("🚀 SCAN FOR HIGH-CONVICTION TRADES"):
+        signals = []
+        watchlist = []
+        
+        with st.spinner("Scanning Institutional Flow..."):
+            for ticker in engine.universe:
+                df = engine.get_data(ticker)
+                setup = engine.detect_fvg(df)
+                if setup:
+                    setup['ticker'] = ticker
+                    # If price is near the FVG zone, it's a signal
+                    if setup['current'] <= setup['entry'] * 1.02:
+                        signals.append(setup)
+                    else:
+                        watchlist.append(setup)
+
+        if signals:
+            st.subheader("🏆 Primary Signal")
+            best = signals[0] # Take first for MVP pick
             
-            if setup:
-                st.subheader("🏆 Pick of the Day")
-                col_chart, col_details = st.columns([2, 1])
+            # Position Sizing
+            risk_amt = capital * (risk_pct / 100)
+            sl_points = best['entry'] - best['sl']
+            lots = int((risk_amt / sl_points) / 100) if sl_points > 0 else 0
+            
+            col_chart, col_info = st.columns([2, 1])
+            
+            with col_chart:
+                # Plotly Chart
+                df_plot = best['df_slice']
+                fig = go.Figure(data=[go.Candlestick(x=df_plot.index, open=df_plot['Open'], high=df_plot['High'], low=df_plot['Low'], close=df_plot['Close'])])
+                fig.add_shape(type="rect", x0=df_plot.index[0], x1=df_plot.index[-1], y0=best['gap'][0], y1=best['gap'][1], fillcolor="LightGreen", opacity=0.3, layer="below", line_width=0)
+                fig.update_layout(template="plotly_dark", height=400, margin=dict(l=0,r=0,b=0,t=0), xaxis_rangeslider_visible=False)
+                st.plotly_chart(fig, use_container_width=True)
                 
-                with col_chart:
-                    render_candlestick("BMRI.JK", setup)
-                
-                with col_details:
-                    st.markdown(f"""
-                    <div class="trade-card">
-                        <h2 style='color:#00ff88;'>BMRI.JK</h2>
-                        <p><b>Entry:</b> {setup['entry']:,.0f}</p>
-                        <p><b>Stop Loss:</b> {setup['sl']:,.0f}</p>
-                        <p><b>Take Profit:</b> {setup['tp']:,.0f}</p>
-                        <hr>
-                        <p style='font-size: 0.8em;'>Calculated Risk: IDR {cap*(risk_pct/100):,.0f}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    if st.button("Confirm & Log Trade"):
-                        st.balloons()
-                        st.success("Trade Logged to Supabase")
-
-            # Watchlist section
-            st.divider()
-            st.subheader("👀 Emerging Setups")
-            w_col1, w_col2, w_col3 = st.columns(3)
-            # Example Watchlist Items
-            for i, col in enumerate([w_col1, w_col2, w_col3]):
-                col.markdown(f"""
-                <div class="watchlist-card">
-                    <h4>TLKM.JK</h4>
-                    <p>Score: 18/25</p>
-                    <small>Waiting for retest of 3,850</small>
+            with col_info:
+                st.markdown(f"""
+                <div class="setup-card">
+                    <h3>{best['ticker']}</h3>
+                    <p><b>Entry:</b> {best['entry']:,.0f}</p>
+                    <p><b>Stop Loss:</b> {best['sl']:,.0f}</p>
+                    <p><b>Take Profit:</b> {best['tp']:,.0f}</p>
+                    <hr style='border: 0.5px solid #30363d;'>
+                    <p style='color:#00ff88'><b>Position: {lots} Lots</b></p>
+                    <small>Risk: IDR {risk_amt:,.0f}</small>
                 </div>
                 """, unsafe_allow_html=True)
+                
+                if st.button("📝 LOG THIS TRADE"):
+                    data = {"ticker": best['ticker'], "entry_price": best['entry'], "stop_loss": best['sl'], "take_profit": best['tp'], "position_size": lots, "date": datetime.now().strftime("%Y-%m-%d"), "status": "OPEN"}
+                    supabase.table("trades").insert(data).execute()
+                    st.success("Trade Logged Successfully!")
 
-    # Performance Dashboard Tabs
+        # Watchlist Section
+        st.divider()
+        st.subheader("👀 Watchlist (Nearing Zones)")
+        if watchlist:
+            w_cols = st.columns(3)
+            for i, w in enumerate(watchlist[:3]):
+                with w_cols[i]:
+                    st.markdown(f"""
+                    <div class="watchlist-box">
+                        <b>{w['ticker']}</b><br>
+                        Wait for: {w['entry']:,.0f}<br>
+                        <small>Current: {w['current']:,.0f}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+    # Performance Tabs
     st.divider()
-    t1, t2 = st.tabs(["📊 Performance Equity", "📜 Trade Logger"])
+    t1, t2 = st.tabs(["📊 Performance", "📜 Trade History"])
     with t1:
-        st.info("Equity curve will appear here after 3+ logged trades.")
+        st.write("Equity Curve Tracking (Supabase Integration)")
     with t2:
-        # Fetch from Supabase
-        st.write("Recent Activity")
-        # st.table(pd.DataFrame(...))
+        try:
+            history = supabase.table("trades").select("*").order("date", desc=True).execute()
+            st.dataframe(pd.DataFrame(history.data), use_container_width=True)
+        except:
+            st.info("Log a trade to see history.")
 
 if __name__ == "__main__":
     main()
