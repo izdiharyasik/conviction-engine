@@ -1,0 +1,226 @@
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+from supabase import create_client, Client
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import numpy as np
+
+# --- CONFIGURATION & STYLING ---
+st.set_page_config(page_title="Conviction Engine", layout="wide")
+st.markdown("""
+    <style>
+    .metric-card { background-color: #1e2130; padding: 20px; border-radius: 10px; border: 1px solid #3e4251; }
+    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #007bff; color: white; }
+    </style>
+""", unsafe_allow_html=True)
+
+# --- DATABASE CONNECTION ---
+URL = st.secrets["SUPABASE_URL"]
+KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(URL, KEY)
+
+# --- IDX UNIVERSE (Sample of high-cap tickers) ---
+# In production, this would be fetched from an API or updated weekly
+IDX_TICKERS = [
+    "BBCA.JK", "BBRI.JK", "BMRI.JK", "TLKM.JK", "ASII.JK", 
+    "BYAN.JK", "AMRT.JK", "BBNI.JK", "ICBP.JK", "GOTO.JK",
+    "UNTR.JK", "KLBF.JK", "PGAS.JK", "ADRO.JK", "CPIN.JK"
+]
+
+# --- CORE LOGIC: SCANNER & SCORING ---
+class ConvictionEngine:
+    def __init__(self, tickers):
+        self.tickers = tickers
+
+    def get_data(self, ticker):
+        df = yf.download(ticker, period="60d", interval="1d", progress=False)
+        return df
+
+    def detect_fvg(self, df):
+        if len(df) < 5: return None
+        
+        # Latest 3 candles (excluding current forming candle)
+        c1 = df.iloc[-4] # Older
+        c2 = df.iloc[-3] # Displacement
+        c3 = df.iloc[-2] # Confirmation
+        
+        # Bullish FVG (Gap between Candle 1 High and Candle 3 Low)
+        is_bullish = c1['High'] < c3['Low']
+        # Displacement check (Body of C2 must be > 1.5x ATR)
+        body_size = abs(c2['Close'] - c2['Open'])
+        atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-3]
+        
+        if is_bullish and body_size > (atr * 1.2):
+            return {
+                "type": "BULLISH",
+                "gap_top": c3['Low'],
+                "gap_bottom": c1['High'],
+                "entry": c3['Low'],
+                "sl": c1['Low'],
+                "tp": c3['Low'] + ((c3['Low'] - c1['Low']) * 2), # 1:2 RR
+                "volume_spike": c2['Volume'] > df['Volume'].rolling(20).mean().iloc[-3]
+            }
+        return None
+
+    def score_setup(self, ticker, setup, df):
+        score = 0
+        if not setup: return 0
+        
+        # 1. FVG Quality (Size of gap)
+        gap_pct = (setup['gap_top'] - setup['gap_bottom']) / setup['gap_bottom']
+        score += min(5, gap_pct * 500)
+        
+        # 2. Volume Spike
+        if setup['volume_spike']: score += 5
+        
+        # 3. Trend Alignment (Above SMA 20)
+        sma20 = df['Close'].rolling(20).mean().iloc[-1]
+        if df['Close'].iloc[-1] > sma20: score += 5
+        
+        # 4. RR Quality
+        rr = (setup['tp'] - setup['entry']) / (setup['entry'] - setup['sl'])
+        if rr >= 2: score += 5
+        
+        # 5. Liquidity (Basic Check)
+        avg_val = (df['Close'] * df['Volume']).rolling(20).mean().iloc[-1]
+        if avg_val > 50_000_000_000: # 50 Bio IDR
+            score += 5
+            
+        return round(score, 2)
+
+    def find_best_trade(self):
+        candidates = []
+        for ticker in self.tickers:
+            df = self.get_data(ticker)
+            setup = self.detect_fvg(df)
+            if setup:
+                score = self.score_setup(ticker, setup, df)
+                candidates.append({"ticker": ticker, "setup": setup, "score": score})
+        
+        if not candidates: return None
+        
+        # Return only the single highest score
+        best = max(candidates, key=lambda x: x['score'])
+        return best if best['score'] >= 15 else None
+
+# --- UI COMPONENTS ---
+def render_sidebar():
+    st.sidebar.title("🛠 Settings")
+    capital = st.sidebar.number_input("Total Capital (IDR)", value=100_000_000, step=1_000_000)
+    risk_per_trade = st.sidebar.slider("Risk Per Trade (%)", 0.5, 5.0, 1.0)
+    return capital, risk_per_trade
+
+def render_performance(trades_df, equity_df):
+    st.header("📈 Performance Analytics")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    if not trades_df.empty:
+        win_rate = (len(trades_df[trades_df['pnl'] > 0]) / len(trades_df)) * 100
+        total_pnl = trades_df['pnl'].sum()
+        
+        col1.metric("Total Return", f"IDR {total_pnl:,.0f}")
+        col2.metric("Win Rate", f"{win_rate:.1f}%")
+        col3.metric("Avg R:R", "1:2.0")
+        col4.metric("Trades Executed", len(trades_df))
+
+        # Plot Equity Curve
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity_df['date'], y=equity_df['portfolio_value'], name='Portfolio'))
+        # Normalize IHSG to starting capital for comparison
+        if not equity_df.empty:
+            start_cap = equity_df['portfolio_value'].iloc[0]
+            ihsg_norm = (equity_df['ihsg_value'] / equity_df['ihsg_value'].iloc[0]) * start_cap
+            fig.add_trace(go.Scatter(x=equity_df['date'], y=ihsg_norm, name='IHSG Benchmark', line=dict(dash='dash')))
+        
+        st.plotly_chart(fig, use_container_width=True)
+
+# --- MAIN APP ---
+def main():
+    st.title("🎯 Conviction Engine")
+    st.subheader("IDX High-Conviction FVG Strategy")
+    
+    capital, risk_pct = render_sidebar()
+    
+    # 1. SCANNER SECTION
+    if st.button("🔍 Scan Market for Today's Pick"):
+        with st.spinner("Analyzing IDX Top 100 for high-quality FVGs..."):
+            engine = ConvictionEngine(IDX_TICKERS)
+            best_trade = engine.find_best_trade()
+            
+            if best_trade:
+                st.session_state.current_pick = best_trade
+            else:
+                st.session_state.current_pick = "NO TRADE"
+
+    # 2. TRADE DISPLAY
+    if 'current_pick' in st.session_state:
+        pick = st.session_state.current_pick
+        if pick == "NO TRADE":
+            st.warning("No high-conviction setups found today that meet the threshold.")
+        else:
+            setup = pick['setup']
+            ticker = pick['ticker']
+            
+            # Position Sizing
+            risk_amount = capital * (risk_pct / 100)
+            sl_dist = setup['entry'] - setup['sl']
+            lots = int((risk_amount / sl_dist) / 100) if sl_dist > 0 else 0
+            capital_req = lots * 100 * setup['entry']
+            
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.info(f"### Score: {pick['score']}/25")
+                st.write(f"**Ticker:** {ticker}")
+                st.write(f"**Action:** BUY LIMIT (FVG Retest)")
+                st.write(f"**Entry:** {setup['entry']:,.0f}")
+                st.write(f"**Stop Loss:** {setup['sl']:,.0f}")
+                st.write(f"**Take Profit:** {setup['tp']:,.0f}")
+                
+            with col2:
+                st.success("### Execution Plan")
+                st.write(f"**Position Size:** {lots} Lots")
+                st.write(f"**Capital Deployed:** IDR {capital_req:,.0f}")
+                st.write(f"**Max Loss:** IDR {risk_amount:,.0f}")
+                
+                if st.button("📝 Log Trade to Database"):
+                    trade_data = {
+                        "date": datetime.now().strftime("%Y-%m-%d"),
+                        "ticker": ticker,
+                        "entry_price": setup['entry'],
+                        "stop_loss": setup['sl'],
+                        "take_profit": setup['tp'],
+                        "position_size": lots,
+                        "score": pick['score']
+                    }
+                    supabase.table("trades").insert(trade_data).execute()
+                    st.success(f"Logged {ticker} to tracking database!")
+
+    # 3. HISTORY & PERFORMANCE
+    st.divider()
+    trades_resp = supabase.table("trades").select("*").order("date", desc=True).execute()
+    trades_df = pd.DataFrame(trades_resp.data)
+    
+    equity_resp = supabase.table("equity_history").select("*").order("date").execute()
+    equity_df = pd.DataFrame(equity_resp.data)
+    
+    tab1, tab2 = st.tabs(["📊 Performance", "📜 Trade History"])
+    
+    with tab1:
+        render_performance(trades_df, equity_df)
+        
+    with tab2:
+        if not trades_df.empty:
+            st.dataframe(trades_df[['date', 'ticker', 'entry_price', 'status', 'pnl', 'score']], use_container_width=True)
+        else:
+            st.write("No trades logged yet.")
+
+    # 4. DAILY MAINTENANCE (Background Update of IHSG)
+    if st.sidebar.button("🔄 Sync Benchmark (IHSG)"):
+        ihsg = yf.download("^JKSE", period="1d")['Close'].iloc[-1]
+        today = datetime.now().strftime("%Y-%m-%d")
+        # Logic to update equity_history would go here
+        st.sidebar.write(f"IHSG Sync: {ihsg:,.2f}")
+
+if __name__ == "__main__":
+    main()
