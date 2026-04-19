@@ -124,6 +124,64 @@ class ConvictionEngine:
         best_pick = max(signals, key=lambda x: x['score']) if signals else None
         return best_pick, watchlist
 
+def run_backtest(self, lookback_days=30):
+        results = []
+        # Get all data for all tickers first to speed up (Bulk download)
+        all_data = {t: self.get_data(t) for t in self.tickers}
+        
+        # We start from 'lookback_days' ago until 5 days ago (to allow time for trade to finish)
+        for i in range(lookback_days, 5, -1):
+            daily_candidates = []
+            
+            for ticker, df in all_data.items():
+                if len(df) < i + 20: continue
+                
+                # Create a "snapshot" of the market as it was on that specific past day
+                df_past = df.iloc[:-i] 
+                current_date = df_past.index[-1]
+                
+                setup = self.detect_fvg(df_past)
+                if setup and setup['type'] == "SIGNAL":
+                    score = self.score_setup(ticker, setup, df_past)
+                    if score >= 15:
+                        daily_candidates.append({
+                            "date": current_date,
+                            "ticker": ticker,
+                            "setup": setup,
+                            "score": score,
+                            "future_data": df.iloc[-i:] # The price action that happened AFTER the signal
+                        })
+            
+            if daily_candidates:
+                # Pick the best trade of that specific historical day
+                best_of_day = max(daily_candidates, key=lambda x: x['score'])
+                
+                # SIMULATE OUTCOME
+                # We check the 'future_data' to see if TP or SL hit first
+                outcome = "PENDING"
+                pnl_pct = 0
+                s = best_of_day['setup']
+                
+                for _, day in best_of_day['future_data'].iterrows():
+                    if day['Low'] <= s['sl']:
+                        outcome = "❌ LOSS"
+                        pnl_pct = -1.0 # Assuming 1R risk
+                        break
+                    elif day['High'] >= s['tp']:
+                        outcome = "✅ WIN"
+                        pnl_pct = 2.0 # Assuming 1:2 RR
+                        break
+                
+                results.append({
+                    "Date": best_of_day['date'].strftime("%Y-%m-%d"),
+                    "Ticker": best_of_day['ticker'],
+                    "Score": best_of_day['score'],
+                    "Result": outcome,
+                    "PnL (R)": pnl_pct
+                })
+        
+        return pd.DataFrame(results)
+
 # --- 4. MAIN INTERFACE ---
 def main():
     st.title("🎯 Conviction Engine")
@@ -170,16 +228,48 @@ def main():
         else:
             st.write("No setups currently forming.")
 
-    # 3. Database & Tracking
+   # 3. Database & Tracking
     st.divider()
     try:
         trades_df = pd.DataFrame(supabase.table("trades").select("*").order("date", desc=True).execute().data)
         equity_df = pd.DataFrame(supabase.table("equity_history").select("*").order("date").execute().data)
-        t1, t2 = st.tabs(["📊 Analytics", "📜 History"])
-        with t1: render_performance(trades_df, equity_df)
-        with t2: st.dataframe(trades_df, use_container_width=True)
-    except:
-        st.error("Database connection failed. Check your Supabase keys.")
+        
+        # ADD BACKTEST TAB HERE
+        t1, t2, t3 = st.tabs(["📊 Analytics", "📜 History", "🧪 Backtest Module"])
+        
+        with t1: 
+            render_performance(trades_df, equity_df)
+            
+        with t2: 
+            st.dataframe(trades_df, use_container_width=True)
+            
+        with t3:
+            st.header("Historical Simulation")
+            st.write("This runs the engine logic on past data to see how 'Conviction Picks' performed.")
+            lookback = st.slider("Lookback Days", 30, 90, 60)
+            
+            if st.button("🚀 Run Historical Backtest"):
+                with st.spinner("Simulating past 60 days of IDX trading..."):
+                    engine = ConvictionEngine(IDX_TICKERS)
+                    backtest_results = engine.run_backtest(lookback)
+                    
+                    if not backtest_results.empty:
+                        # Summary Stats
+                        wins = len(backtest_results[backtest_results['Result'] == "✅ WIN"])
+                        losses = len(backtest_results[backtest_results['Result'] == "❌ LOSS"])
+                        win_rate = (wins / (wins + losses)) * 100 if (wins + losses) > 0 else 0
+                        total_r = backtest_results['PnL (R)'].sum()
+                        
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Win Rate", f"{win_rate:.1f}%")
+                        c2.metric("Total Return (R)", f"{total_r:.1f}R")
+                        c3.metric("Total Signals", len(backtest_results))
+                        
+                        st.dataframe(backtest_results, use_container_width=True)
+                    else:
+                        st.warning("No historical signals met the high-conviction threshold in this period.")
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
