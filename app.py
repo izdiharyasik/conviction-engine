@@ -49,7 +49,7 @@ def render_performance(trades_df, equity_df):
             start_cap = equity_df['portfolio_value'].iloc[0]
             ihsg_norm = (equity_df['ihsg_value'] / equity_df['ihsg_value'].iloc[0]) * start_cap
             fig.add_trace(go.Scatter(x=equity_df['date'], y=ihsg_norm, name='IHSG Benchmark', line=dict(dash='dash')))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True) # use_container_width is still standard for Plotly
     else:
         st.info("Log your first trade to see performance analytics.")
 
@@ -196,16 +196,18 @@ def main():
                 with cols[idx % 3]:
                     st.info(f"**{item['ticker']}** (Score: {item['score']})\n\nWait for: {item['setup']['entry']:,.0f}")
 
-    # 3. Analytics, History, and Backtest Tabs
+    # 3. Database & Tracking
     st.divider()
     try:
-        trades_df = pd.DataFrame(supabase.table("trades").select("*").order("date", desc=True).execute().data)
-        equity_df = pd.DataFrame(supabase.table("equity_history").select("*").order("date").execute().data)
+        trades_resp = supabase.table("trades").select("*").order("date", desc=True).execute()
+        trades_df = pd.DataFrame(trades_resp.data)
+        equity_resp = supabase.table("equity_history").select("*").order("date").execute()
+        equity_df = pd.DataFrame(equity_resp.data)
         
         t1, t2, t3 = st.tabs(["📊 Analytics", "📜 History", "🧪 Backtest"])
         
         with t1: render_performance(trades_df, equity_df)
-        with t2: st.dataframe(trades_df, width=None) # width=None replaces use_container_width
+        with t2: st.dataframe(trades_df, width="stretch") 
         with t3:
             st.header("Historical Simulation")
             lookback = st.slider("Days to test", 30, 90, 60)
@@ -219,7 +221,7 @@ def main():
                         total = len(bt_results[bt_results['Result'] != "PENDING"])
                         c1.metric("Simulated Win Rate", f"{(wins/total)*100:.1f}%" if total > 0 else "0%")
                         c2.metric("Total Profit (R)", f"{bt_results['PnL (R)'].sum():.1f}R")
-                        st.dataframe(bt_results, width=None)
+                        st.dataframe(bt_results, width="stretch")
                     else:
                         st.write("No historical picks found in this period.")
     except Exception as e:
