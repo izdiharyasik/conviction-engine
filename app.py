@@ -171,6 +171,60 @@ def render_performance(trades_df, equity_df):
         
         st.plotly_chart(fig, use_container_width=True)
 
+def detect_fvg(self, df):
+        if df is None or len(df) < 20: return None
+        try:
+            # Check last few candles for an UNFILLED gap
+            # We look back 5 days to see if any recent FVG is still "open"
+            for i in range(2, 6):
+                c1 = df.iloc[-i-2]
+                c2 = df.iloc[-i-1] # The big displacement candle
+                c3 = df.iloc[-i]
+                
+                c1_high = float(c1['High'])
+                c3_low = float(c3['Low'])
+                current_price = float(df['Close'].iloc[-1])
+
+                # Bullish FVG check
+                if c1_high < c3_low:
+                    body_size = abs(float(c2['Close']) - float(c2['Open']))
+                    atr = (df['High'] - df['Low']).rolling(14).mean().iloc[-i-1]
+                    
+                    if body_size > (atr * 1.2):
+                        # Is it a SIGNAL or just a WATCHLIST?
+                        # SIGNAL: Price is currently touching or just rejected the gap
+                        if current_price <= c3_low and current_price >= c1_high:
+                            return {"type": "SIGNAL", "entry": c3_low, "sl": float(c1['Low']), "gap": (c1_high, c3_low)}
+                        
+                        # WATCHLIST: Gap exists but price is still above it
+                        if current_price > c3_low:
+                            return {"type": "WATCHLIST", "entry": c3_low, "sl": float(c1['Low']), "gap": (c1_high, c3_low)}
+        except:
+            return None
+        return None
+
+    def scan_all(self):
+        signals = []
+        watchlist = []
+        
+        for ticker in self.tickers:
+            df = self.get_data(ticker)
+            if df.empty: continue
+            
+            setup = self.detect_fvg(df)
+            if setup:
+                score = self.score_setup(ticker, setup, df)
+                item = {"ticker": ticker, "setup": setup, "score": score}
+                
+                if setup['type'] == "SIGNAL" and score >= 15:
+                    signals.append(item)
+                elif score >= 10: # Lower threshold for watchlist
+                    watchlist.append(item)
+        
+        # Best Signal = Pick of the Day
+        best_pick = max(signals, key=lambda x: x['score']) if signals else None
+        return best_pick, watchlist
+        
 # --- MAIN APP ---
 def main():
     st.title("🎯 Conviction Engine")
@@ -231,6 +285,37 @@ def main():
                     }
                     supabase.table("trades").insert(trade_data).execute()
                     st.success(f"Logged {ticker} to tracking database!")
+
+     if st.button("🔍 Run Full Market Scan"):
+        with st.spinner("Scanning IDX Universe..."):
+            engine = ConvictionEngine(IDX_TICKERS)
+            best_pick, watchlist_items = engine.scan_all()
+            
+            # 1. TOP PICK (The "Conviction" Part)
+            st.header("🏆 Today's Conviction Pick")
+            if best_pick:
+                # ... (Display your existing Trade Card for best_pick) ...
+            else:
+                st.warning("NO HIGH-CONVICTION TRADE TODAY")
+
+            # 2. WATCHLIST (The "Nearing" Part)
+            st.divider()
+            st.header("👀 Setup Watchlist")
+            st.write("Stocks with valid gaps waiting for a retest:")
+            
+            if watchlist_items:
+                cols = st.columns(3)
+                for idx, item in enumerate(watchlist_items[:6]): # Show top 6
+                    with cols[idx % 3]:
+                        st.markdown(f"""
+                        <div style="border:1px solid #444; padding:10px; border-radius:5px">
+                            <h4>{item['ticker']}</h4>
+                            <p>Score: {item['score']}</p>
+                            <p>Buy Zone: {item['setup']['gap'][0]:,.0f} - {item['setup']['gap'][1]:,.0f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                st.write("No setups currently forming.")
 
     # 3. HISTORY & PERFORMANCE
     st.divider()
